@@ -38,6 +38,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener {
 
 	final String htmlindent = "&nbsp;&nbsp;&nbsp;";
 	final String CRLF = "\r\n";
+	final String hexchars = "0123456789abcdefABCDEF";
 
 	@Override
 	public void registerExtenderCallbacks(final IBurpExtenderCallbacks callbacks) {
@@ -318,10 +319,73 @@ public class BurpExtender implements IBurpExtender, IHttpListener {
 		return null;
 	}
 
+	private String DecodeUrl(String tracestr) {
+		// Because java.net.URLDecoder.decode (understandably) throws an exception if there is a percent symbol anywhere not followed by two hex chars.
+
+		int pos = -1;
+		while ((pos = tracestr.indexOf("%", pos + 1)) > -1) {
+			if (pos > tracestr.length() - 2) break;
+
+			if (hexchars.indexOf(tracestr.charAt(pos + 1)) > -1 && hexchars.indexOf(tracestr.charAt(pos + 2)) > -1) {
+				tracestr = tracestr.replace(tracestr.substring(pos, pos + 3), ((char)Integer.parseInt(tracestr.substring(pos + 1, pos + 3), 16)) + "");
+				pos--;
+			}
+		}
+
+		return tracestr;
+	}
+
+	private String DecodeStackTraceHtml(String tracestr) {
+		// It seems we'd need to include a library to do HTML decoding... but it's not all that difficult given the limited charset in a stack trace,
+		// so that seems like overkill, and now we can do things like fix double encoding, ignore invalid encoding without aborting altogether, etc.
+
+		if ( ! tracestr.contains("&")) {
+			return tracestr;
+		}
+
+		tracestr = tracestr.replace("&amp;", "&"); // Fix any double encoding first
+
+		Map<String, String> replacemap = new HashMap<String, String>() {{
+			put("nbsp", " ");
+			put("nonbreakingspace", " ");
+			put("tab", " ");
+			put("lt", "<");
+			put("gt", ">");
+			put("dollar", "$");
+			put("lpar", "(");
+			put("rpar", ")");
+			put("period", ".");
+			put("colon", ":");
+		}};
+		// If the {1,6} is expanded to allow >=8 chars (technically valid b/c leading zeroes... currently unsupported because that's within the realm of obfuscation
+		// and if you want to obfuscate your stack traces... there are easier methods to evade BeanStack), then you will need to try{} below to avoid >int_max.
+		Pattern pattern = Pattern.compile("(&(#[0-9]{1,6}|#x[0-9a-f]{1,9}|nbsp|NonBreakingSpace|tab|lt|gt|dollar|lpar|rpar|period|colon);)", Pattern.CASE_INSENSITIVE);
+		Matcher matcher = pattern.matcher(tracestr);
+		while (matcher.find()) {
+			if (matcher.group(2).startsWith("#")) { // If we have a third group, then we matched a numeric or hex entity
+				if (matcher.group(2).toLowerCase().startsWith("#x")) {
+					tracestr = tracestr.replace(matcher.group(1), ((char)Integer.parseInt(matcher.group(2).substring(2), 16)) + "");
+				}
+				else {
+					tracestr = tracestr.replace(matcher.group(1), ((char)Integer.parseInt(matcher.group(2).substring(1))) + "");
+				}
+			}
+			else {
+				String lce = matcher.group(2).toLowerCase();
+				if ( ! replacemap.containsKey(lce)) {
+					continue;
+				}
+				tracestr = tracestr.replace(matcher.group(1), replacemap.get(lce));
+			}
+		}
+
+		return tracestr;
+	}
+
 	@Override
 	public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse baseRequestResponse) {
 		if (messageIsRequest) {
-			// TODO maybe also the request instead of only the response?
+			// If the trace is locally generated, it probably isn't interesting for us
 			return;
 		}
 
@@ -333,21 +397,30 @@ public class BurpExtender implements IBurpExtender, IHttpListener {
 		threader.submit(new Runnable() {
 			public void run() {
 				String response = null;
-
-				// Basically the pattern checks /\s[valid class path chars].[more valid class chars]([filename chars].java:1234)/
-				Pattern pattern = Pattern.compile("(\\s|/)([a-zA-Z0-9\\.\\$]{1,300}\\.[a-zA-Z0-9\\.\\$]{1,300})\\(([a-zA-Z0-9]{1,300})\\.java:\\d{1,6}\\)");
+				int sizelimit = GlobalVars.config.getInt("sizelimit") * 1024 * 1024;
 
 				try {
-					response = new String(baseRequestResponse.getResponse(), "UTF-8");
+					byte[] bytesresponse = baseRequestResponse.getResponse();
+					int startedwith = bytesresponse.length;
+					if (bytesresponse.length > sizelimit) {
+						byte[] partial = new byte[sizelimit];
+						System.arraycopy(bytesresponse, 0                                   , partial, 0            , sizelimit / 2);
+						System.arraycopy(bytesresponse, bytesresponse.length - sizelimit / 2, partial, sizelimit / 2, sizelimit / 2);
+						bytesresponse = partial;
+						partial = null;
+					}
+					response = new String(bytesresponse, "UTF-8");
 				}
 				catch (java.io.UnsupportedEncodingException e) {
 					e.printStackTrace(new java.io.PrintStream(GlobalVars.debug));
 				}
 
-				response = response.replace("\\$", "$").replace("\\/", "/").replace("&nbsp;", " ");
-				response = java.net.URLDecoder.decode(response);
-				// HTML is not decoded because stack traces do not contain any characters that have to be &escaped;
+				response = response.replace("\\$", "$").replace("\\/", "/");
+				response = DecodeUrl(response);
+				response = DecodeStackTraceHtml(response);
 
+				// Basically the pattern checks /\s[valid class path chars].[more valid class chars]([filename chars].java:1234)/
+				Pattern pattern = Pattern.compile("(\\s|/)([a-zA-Z0-9\\.\\$]{1,300}\\.[a-zA-Z0-9\\.\\$]{1,300})\\(([a-zA-Z0-9]{1,300})\\.java:\\d{1,6}\\)");
 				Matcher matcher = pattern.matcher(response);
 
 				// Reconstruct the trace (since who knows what might be in between the lines, e.g. "&lt;br&gt;" or "," or "\n")
@@ -359,8 +432,7 @@ public class BurpExtender implements IBurpExtender, IHttpListener {
 					}
 					if ( ! (matcher.group(2).indexOf(matcher.group(3) + "$") >= 2
 							|| matcher.group(2).indexOf(matcher.group(3) + ".") >= 2)) {
-						// TODO is this check too strict?
-						// (It's strict because, if it's too loose, we might submit all sorts of private data to our API)
+						// (^Some extra checks to prevent submitting false positives to our API.)
 						// The filename should occur in the first part, either followed by a dollar or by a dot,
 						// and it usually does not start with that (so match from position 2 onwards, because
 						// there should be at least 1 character and a dot, like "a.test.run(test.java:42)").
