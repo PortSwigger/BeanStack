@@ -167,6 +167,7 @@ public class Config {
         panel.setLayout(new GridLayout(0, 2));
 
         JLabel lbl = new JLabel("<html>" + GlobalVars.EXTENSION_NAME_SHORT + " settings (<a href=''>documentation</a>)</html>");
+        lbl.putClientProperty("html.disable", null);
         lbl.setCursor(new Cursor(Cursor.HAND_CURSOR));
         panel.add(lbl);
 
